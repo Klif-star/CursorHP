@@ -24,12 +24,15 @@ public class CursorService extends AccessibilityService
         implements SharedPreferences.OnSharedPreferenceChangeListener {
 
     private static final long HOLD_MS = 350;
+    private static final float GAIN = 2f;
 
     private WindowManager wm;
     private SharedPreferences sp;
     private CursorView cursor;
     private PadView pad;
     private WindowManager.LayoutParams padLp;
+    private WindowManager.LayoutParams cursorLp;
+    private float curX, curY;
 
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
@@ -41,16 +44,22 @@ public class CursorService extends AccessibilityService
         sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
         sp.registerOnSharedPreferenceChangeListener(this);
 
+        DisplayMetrics m = screen();
+        curX = m.widthPixels / 2f;
+        curY = m.heightPixels / 2f;
+
         cursor = new CursorView(this);
-        WindowManager.LayoutParams cl = new WindowManager.LayoutParams(
+        cursorLp = new WindowManager.LayoutParams(
                 dp(48), dp(48),
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
-        cl.gravity = Gravity.CENTER;
-        wm.addView(cursor, cl);
+        cursorLp.gravity = Gravity.TOP | Gravity.START;
+        setCursorLp();
+        wm.addView(cursor, cursorLp);
 
         pad = new PadView(this);
         padLp = new WindowManager.LayoutParams(
@@ -130,16 +139,28 @@ public class CursorService extends AccessibilityService
         pad = null;
     }
 
-    // ---------- Gestur ke layar ----------
+    // ---------- Posisi kursor dan gestur ke layar ----------
 
-    private float[] center() {
-        DisplayMetrics m = getResources().getDisplayMetrics();
-        if (cursor != null && cursor.getWidth() > 0) {
-            int[] loc = new int[2];
-            cursor.getLocationOnScreen(loc);
-            return new float[]{loc[0] + cursor.getWidth() / 2f, loc[1] + cursor.getHeight() / 2f};
-        }
-        return new float[]{m.widthPixels / 2f, m.heightPixels / 2f};
+    private DisplayMetrics screen() {
+        DisplayMetrics m = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(m);
+        return m;
+    }
+
+    private void setCursorLp() {
+        cursorLp.x = Math.round(curX) - cursorLp.width / 2;
+        cursorLp.y = Math.round(curY) - cursorLp.height / 2;
+    }
+
+    private void moveCursorBy(float dx, float dy) {
+        if (cursor == null) return;
+        DisplayMetrics m = screen();
+        curX = Math.max(0, Math.min(m.widthPixels - 1, curX + dx));
+        curY = Math.max(0, Math.min(m.heightPixels - 1, curY + dy));
+        setCursorLp();
+        try {
+            wm.updateViewLayout(cursor, cursorLp);
+        } catch (Exception ignored) {}
     }
 
     private void send(Path p, long dur) {
@@ -149,38 +170,19 @@ public class CursorService extends AccessibilityService
     }
 
     private void doTap() {
-        float[] c = center();
         Path p = new Path();
-        p.moveTo(c[0], c[1]);
+        p.moveTo(curX, curY);
         send(p, 50);
     }
 
-    private void doSwipe(float dx, float dy, long dur) {
-        DisplayMetrics m = getResources().getDisplayMetrics();
-        float[] c = center();
-        float ex = Math.max(5, Math.min(m.widthPixels - 5, c[0] + dx));
-        float ey = Math.max(5, Math.min(m.heightPixels - 5, c[1] + dy));
-        Path p = new Path();
-        p.moveTo(c[0], c[1]);
-        p.lineTo(ex, ey);
-        send(p, dur);
-    }
-
-    // Tahan lalu geser: tarik pelan dari posisi kursor
-    private void doDrag(float dx, float dy) {
-        float dist = (float) Math.hypot(dx, dy);
+    // Tahan lalu geser: tarik pelan dari titik awal ke posisi kursor sekarang
+    private void doDrag(float sx, float sy, float ex, float ey) {
+        float dist = (float) Math.hypot(ex - sx, ey - sy);
         if (dist < 5) return;
-        doSwipe(dx * 2, dy * 2, Math.max(300, (long) (dist * 3)));
-    }
-
-    // Geser cepat: kibasan cepat (ganti halaman / scroll cepat)
-    private void doFling(float dx, float dy) {
-        float dist = (float) Math.hypot(dx, dy);
-        if (dist < 1) return;
-        DisplayMetrics m = getResources().getDisplayMetrics();
-        float ux = dx / dist, uy = dy / dist;
-        float len = 0.6f * (Math.abs(ux) * m.widthPixels + Math.abs(uy) * m.heightPixels);
-        doSwipe(ux * len, uy * len, 100);
+        Path p = new Path();
+        p.moveTo(sx, sy);
+        p.lineTo(ex, ey);
+        send(p, Math.max(300, (long) (dist * 2)));
     }
 
     // ---------- Tampilan ----------
@@ -225,7 +227,7 @@ public class CursorService extends AccessibilityService
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final int slop;
-        private float downX, downY;
+        private float downX, downY, lastX, lastY, dragSX, dragSY;
         private long downT;
         private boolean hold, moved;
 
@@ -233,6 +235,8 @@ public class CursorService extends AccessibilityService
             public void run() {
                 if (!moved) {
                     hold = true;
+                    dragSX = curX;
+                    dragSY = curY;
                     performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
                     invalidate();
                 }
@@ -266,29 +270,34 @@ public class CursorService extends AccessibilityService
         public boolean onTouchEvent(MotionEvent e) {
             switch (e.getAction()) {
                 case MotionEvent.ACTION_DOWN:
-                    downX = e.getX();
-                    downY = e.getY();
+                    downX = lastX = e.getX();
+                    downY = lastY = e.getY();
                     downT = System.currentTimeMillis();
                     hold = false;
                     moved = false;
                     postDelayed(holdRun, HOLD_MS);
                     return true;
                 case MotionEvent.ACTION_MOVE:
-                    if (!moved && Math.hypot(e.getX() - downX, e.getY() - downY) > slop) {
-                        moved = true;
-                        if (!hold) removeCallbacks(holdRun);
+                    if (!moved) {
+                        if (Math.hypot(e.getX() - downX, e.getY() - downY) > slop) {
+                            moved = true;
+                            if (!hold) removeCallbacks(holdRun);
+                            lastX = e.getX();
+                            lastY = e.getY();
+                        }
+                    } else {
+                        moveCursorBy((e.getX() - lastX) * GAIN, (e.getY() - lastY) * GAIN);
+                        lastX = e.getX();
+                        lastY = e.getY();
                     }
                     return true;
                 case MotionEvent.ACTION_UP: {
                     removeCallbacks(holdRun);
-                    float dx = e.getX() - downX, dy = e.getY() - downY;
                     long dt = System.currentTimeMillis() - downT;
                     if (!moved) {
                         if (!hold && dt < HOLD_MS) doTap();
                     } else if (hold) {
-                        doDrag(dx, dy);
-                    } else {
-                        doFling(dx, dy);
+                        doDrag(dragSX, dragSY, curX, curY);
                     }
                     hold = false;
                     invalidate();

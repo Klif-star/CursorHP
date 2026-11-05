@@ -30,7 +30,7 @@ import java.io.InputStream;
 public class MainActivity extends Activity {
     static final String PREFS = "cfg";
     static final int SIZE_MIN = 60, SIZE_MAX = 250;
-    static final int OP_MIN = 20, OP_MAX = 100;
+    static final int OP_MIN = 5, OP_MAX = 100;
     private static final int REQ_IMG = 11;
 
     private static final String[] ACT_LABELS = {
@@ -168,6 +168,14 @@ public class MainActivity extends Activity {
         addFlick("Kibas ke kiri", "flick_left", "swipe");
         addFlick("Kibas ke kanan", "flick_right", "swipe");
 
+        section("Tahan + geser");
+        addSwitch("Kursor ikut bergerak saat tahan + geser (mati = kursor diam)",
+                "live_follow", false);
+
+        section("Efek");
+        addSwitch("Jejak kursor (trail)", "trail", false);
+        addSwitch("Efek ketuk", "tap_fx", false);
+
         section("Bentuk kursor");
         cursorGroup = new RadioGroup(this);
         cursorGroup.setOrientation(RadioGroup.VERTICAL);
@@ -206,6 +214,13 @@ public class MainActivity extends Activity {
 
         addSwitch("Gambar sendiri: titik klik di tengah gambar (mati = pojok kiri atas)",
                 "custom_center", false);
+
+        addSwitch("Gambar sendiri: hapus warna latar", "custom_rm", true);
+        addSeek("custom_tol", 5, 120, 40, new Fmt() {
+            public String text(int v) {
+                return "Kekuatan hapus latar: " + v + " (naikkan kalau latar masih tersisa)";
+            }
+        });
 
         addSeek("cursor_size", 16, 96, 24, new Fmt() {
             public String text(int v) {

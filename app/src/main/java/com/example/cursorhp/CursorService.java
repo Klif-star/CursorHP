@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -11,24 +12,30 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 
 public class CursorService extends AccessibilityService
@@ -36,6 +43,7 @@ public class CursorService extends AccessibilityService
 
     private static final long HOLD_MS = 350;
 
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private WindowManager wm;
     private SharedPreferences sp;
     private CursorView cursor;
@@ -45,8 +53,10 @@ public class CursorService extends AccessibilityService
     private WindowManager.LayoutParams padLp;
     private WindowManager.LayoutParams cursorLp;
 
-    // Posisi ujung kursor di layar (piksel)
+    // Posisi ujung (titik klik) kursor di layar, dalam piksel layar
     private float curX, curY;
+    // Selisih titik awal jendela overlay terhadap titik awal layar (dikalibrasi otomatis)
+    private float offX = 0, offY = 0;
 
     // Pengaturan
     private float gain = 2f;
@@ -54,23 +64,33 @@ public class CursorService extends AccessibilityService
     private boolean flickOn = true;
     private float flickThrDp = 1400f;
     private final String[] flickAct = {"scroll", "scroll", "swipe", "swipe"}; // atas, bawah, kiri, kanan
-    private String cursorShape = "arrow";
     private int cursorSizeDp = 24;
-    private boolean customCenter = false;
-    private Bitmap customBmp;
-    private boolean customRm = true;
-    private int customTol = 40;
-    private String customKey = "";
+    private boolean imgRm = true;
+    private int imgTol = 40;
     private boolean trailOn = false;
     private boolean tapFx = false;
-    private boolean moveMode = false;
     private boolean liveFollow = false;
-    private float liveX, liveY;
+    private int loadMs = 1200;
 
-    // Mode tahan + geser langsung
+    // Tiga keadaan kursor: normal, di atas kolom teks, loading
+    private String curN = "arrow", curT = "ibeam", curL = "spinner";
+    private boolean hotN = false, hotT = true, hotL = true; // true = titik klik di tengah gambar
+    private Bitmap bmpN, bmpT, bmpL;
+    private final HashMap<String, Bitmap> imgCache = new HashMap<String, Bitmap>();
+    private final HashMap<String, String> imgKey = new HashMap<String, String>();
+    private boolean overText = false;
+    private long loadUntil = 0;
+    private String lastPkg = "";
+
+    // Mode lingkaran
     private boolean liveMode = false;
+    private boolean moveMode = false;
+    private boolean padHidden = false;
+    private boolean hideLeft = false;
+
+    // Tahan + geser langsung
     private boolean liveActive, liveEnding, liveInFlight;
-    private float liveSX, liveSY;
+    private float liveSX, liveSY, liveX, liveY;
     private GestureDescription.StrokeDescription liveStroke;
 
     private int dp(int v) {
@@ -82,6 +102,23 @@ public class CursorService extends AccessibilityService
         wm.getDefaultDisplay().getRealMetrics(m);
         return m;
     }
+
+    private final Runnable calibRun = new Runnable() {
+        public void run() {
+            calibrate();
+        }
+    };
+
+    private final Runnable textRun = new Runnable() {
+        public void run() {
+            if (cursor == null) return;
+            boolean now = "same".equals(curT) ? false : hitEditable();
+            if (now != overText) {
+                overText = now;
+                cursor.invalidate();
+            }
+        }
+    };
 
     @Override
     protected void onServiceConnected() {
@@ -103,7 +140,7 @@ public class CursorService extends AccessibilityService
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
-        el.gravity = Gravity.TOP | Gravity.START;
+        el.gravity = Gravity.TOP | Gravity.LEFT;
         wm.addView(effect, el);
 
         cursor = new CursorView(this);
@@ -115,7 +152,7 @@ public class CursorService extends AccessibilityService
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
-        cursorLp.gravity = Gravity.TOP | Gravity.START;
+        cursorLp.gravity = Gravity.TOP | Gravity.LEFT;
         setCursorLp();
         wm.addView(cursor, cursorLp);
 
@@ -124,7 +161,8 @@ public class CursorService extends AccessibilityService
                 dp(120), dp(120),
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         padLp.gravity = Gravity.BOTTOM | Gravity.END;
         padLp.x = dp(24);
@@ -132,7 +170,10 @@ public class CursorService extends AccessibilityService
         wm.addView(pad, padLp);
 
         applyPrefs();
+        handler.postDelayed(calibRun, 500);
     }
+
+    // ---------- Pengaturan ----------
 
     private void applyPrefs() {
         if (pad == null || cursor == null) return;
@@ -140,11 +181,12 @@ public class CursorService extends AccessibilityService
         int size = dp(sp.getInt("size", 120));
         padLp.width = size;
         padLp.height = size;
-        padLp.x = sp.getInt("pad_x", dp(24));
-        padLp.y = sp.getInt("pad_y", dp(80));
+        applyPadPos();
         pad.circle = sp.getString("shape", "circle").equals("circle");
         pad.setAlpha(sp.getInt("opacity", 70) / 100f);
-        wm.updateViewLayout(pad, padLp);
+        try {
+            wm.updateViewLayout(pad, padLp);
+        } catch (Exception ignored) {}
         pad.invalidate();
 
         gain = sp.getInt("speed", 20) / 10f;
@@ -155,40 +197,76 @@ public class CursorService extends AccessibilityService
         flickAct[1] = sp.getString("flick_down", "scroll");
         flickAct[2] = sp.getString("flick_left", "swipe");
         flickAct[3] = sp.getString("flick_right", "swipe");
-
-        cursorShape = sp.getString("cursor_shape", "arrow");
-        cursorSizeDp = sp.getInt("cursor_size", 24);
-        customCenter = sp.getBoolean("custom_center", false);
-        customRm = sp.getBoolean("custom_rm", true);
-        customTol = sp.getInt("custom_tol", 40);
         trailOn = sp.getBoolean("trail", false);
         tapFx = sp.getBoolean("tap_fx", false);
         liveFollow = sp.getBoolean("live_follow", false);
-        loadCustom();
+        loadMs = sp.getInt("load_ms", 1200);
+
+        cursorSizeDp = sp.getInt("cursor_size", 24);
+        imgRm = sp.getBoolean("custom_rm", true);
+        imgTol = sp.getInt("custom_tol", 40);
+        curN = sp.getString("cur_normal", "arrow");
+        curT = sp.getString("cur_text", "ibeam");
+        curL = sp.getString("cur_load", "spinner");
+        hotN = sp.getBoolean("hot_normal", false);
+        hotT = sp.getBoolean("hot_text", true);
+        hotL = sp.getBoolean("hot_load", true);
+        bmpN = resolve(curN);
+        bmpT = resolve(curT);
+        bmpL = resolve(curL);
+
         int w = dp(cursorSizeDp) * 2;
         cursorLp.width = w;
         cursorLp.height = w;
         setCursorLp();
-        wm.updateViewLayout(cursor, cursorLp);
+        try {
+            wm.updateViewLayout(cursor, cursorLp);
+        } catch (Exception ignored) {}
         cursor.invalidate();
 
         updateVisibility();
+        handler.removeCallbacks(calibRun);
+        handler.postDelayed(calibRun, 300);
     }
 
-    private void loadCustom() {
-        File f = new File(getFilesDir(), "cursor.png");
-        if (!f.exists()) {
-            customBmp = null;
-            customKey = "";
-            return;
-        }
-        String key = f.lastModified() + ":" + customRm + ":" + customTol;
-        if (customBmp == null || !key.equals(customKey)) {
-            Bitmap raw = BitmapFactory.decodeFile(f.getAbsolutePath());
-            if (raw != null && customRm) raw = removeBg(raw, customTol);
-            customBmp = raw;
-            customKey = key;
-        }
+    @Override
+    public void onSharedPreferenceChanged(SharedPreferences p, String key) {
+        applyPrefs();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration c) {
+        super.onConfigurationChanged(c);
+        if (pad == null || cursor == null) return;
+        applyPadPos();
+        try {
+            wm.updateViewLayout(pad, padLp);
+        } catch (Exception ignored) {}
+        placeCursor(curX, curY);
+        handler.removeCallbacks(calibRun);
+        handler.postDelayed(calibRun, 400);
+    }
+
+    // ---------- Gambar kursor ----------
+
+    private Bitmap resolve(String v) {
+        if (v == null || !v.startsWith("img:")) return null;
+        return loadImg(v.substring(4));
+    }
+
+    private Bitmap loadImg(String name) {
+        File f = new File(new File(getFilesDir(), "cursors"), name);
+        if (!f.exists()) return null;
+        String key = f.lastModified() + ":" + imgRm + ":" + imgTol;
+        Bitmap cached = imgCache.get(name);
+        if (cached != null && key.equals(imgKey.get(name))) return cached;
+        Bitmap raw = BitmapFactory.decodeFile(f.getAbsolutePath());
+        if (raw == null) return null;
+        if (imgRm) raw = removeBg(raw, imgTol);
+        raw = trim(raw);
+        imgCache.put(name, raw);
+        imgKey.put(name, key);
+        return raw;
     }
 
     private boolean bgMatch(int c, int r, int g, int b, int tol) {
@@ -246,9 +324,77 @@ public class CursorService extends AccessibilityService
         return Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
     }
 
-    @Override
-    public void onSharedPreferenceChanged(SharedPreferences p, String key) {
-        applyPrefs();
+    // Potong tepi transparan supaya isi gambar memenuhi ukuran kursor
+    private Bitmap trim(Bitmap src) {
+        int w = src.getWidth(), h = src.getHeight();
+        int[] px = new int[w * h];
+        src.getPixels(px, 0, w, 0, 0, w, h);
+        int minX = w, minY = h, maxX = -1, maxY = -1;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (Color.alpha(px[y * w + x]) > 16) {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX < 0) return src;
+        if (minX == 0 && minY == 0 && maxX == w - 1 && maxY == h - 1) return src;
+        return Bitmap.createBitmap(src, minX, minY, maxX - minX + 1, maxY - minY + 1);
+    }
+
+    // ---------- Keadaan kursor ----------
+
+    // 0 normal, 1 di atas kolom teks, 2 loading
+    private int cursorState() {
+        if (loadMs > 0 && SystemClock.uptimeMillis() < loadUntil) return 2;
+        if (overText) return 1;
+        return 0;
+    }
+
+    private void startLoading() {
+        if (loadMs <= 0 || cursor == null) return;
+        loadUntil = SystemClock.uptimeMillis() + loadMs;
+        cursor.invalidate();
+        handler.postDelayed(new Runnable() {
+            public void run() {
+                if (cursor != null) cursor.invalidate();
+            }
+        }, loadMs + 60);
+    }
+
+    private void scheduleTextCheck() {
+        handler.removeCallbacks(textRun);
+        handler.postDelayed(textRun, 120);
+    }
+
+    private boolean hitEditable() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+        return findEditable(root, Math.round(curX), Math.round(curY), 0);
+    }
+
+    private boolean findEditable(AccessibilityNodeInfo n, int x, int y, int depth) {
+        if (n == null || depth > 40) return false;
+        Rect r = new Rect();
+        n.getBoundsInScreen(r);
+        if (!r.contains(x, y)) return false;
+        int cnt = n.getChildCount();
+        for (int i = 0; i < cnt; i++) {
+            if (findEditable(n.getChild(i), x, y, depth + 1)) return true;
+        }
+        return n.isEditable() && n.isVisibleToUser();
+    }
+
+    private boolean isAppWindow(int windowId) {
+        List<AccessibilityWindowInfo> ws = getWindows();
+        if (ws == null) return false;
+        for (AccessibilityWindowInfo w : ws) {
+            if (w.getId() == windowId) return w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION;
+        }
+        return false;
     }
 
     private boolean keyboardShown() {
@@ -276,6 +422,15 @@ public class CursorService extends AccessibilityService
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         updateVisibility();
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            CharSequence pk = event.getPackageName();
+            String pkg = pk == null ? "" : pk.toString();
+            if (!pkg.isEmpty() && !pkg.equals(getPackageName()) && isAppWindow(event.getWindowId())) {
+                if (!lastPkg.isEmpty() && !pkg.equals(lastPkg)) startLoading();
+                lastPkg = pkg;
+            }
+            scheduleTextCheck();
+        }
     }
 
     @Override
@@ -295,6 +450,7 @@ public class CursorService extends AccessibilityService
 
     private void cleanup() {
         if (sp != null) sp.unregisterOnSharedPreferenceChangeListener(this);
+        handler.removeCallbacksAndMessages(null);
         hideMenu();
         try {
             if (effect != null) wm.removeView(effect);
@@ -309,8 +465,25 @@ public class CursorService extends AccessibilityService
     // ---------- Posisi kursor ----------
 
     private void setCursorLp() {
-        cursorLp.x = Math.round(curX) - cursorLp.width / 2;
-        cursorLp.y = Math.round(curY) - cursorLp.height / 2;
+        cursorLp.x = Math.round(curX - offX) - cursorLp.width / 2;
+        cursorLp.y = Math.round(curY - offY) - cursorLp.height / 2;
+    }
+
+    // Samakan koordinat jendela overlay dengan koordinat layar, supaya titik klik dan gambar tepat
+    private void calibrate() {
+        if (cursor == null || cursor.getWidth() == 0) return;
+        int[] loc = new int[2];
+        cursor.getLocationOnScreen(loc);
+        float ox = loc[0] - cursorLp.x;
+        float oy = loc[1] - cursorLp.y;
+        if (Math.abs(ox - offX) > 0.5f || Math.abs(oy - offY) > 0.5f) {
+            offX = ox;
+            offY = oy;
+            setCursorLp();
+            try {
+                wm.updateViewLayout(cursor, cursorLp);
+            } catch (Exception ignored) {}
+        }
     }
 
     private void placeCursor(float x, float y) {
@@ -319,15 +492,70 @@ public class CursorService extends AccessibilityService
         float ox = curX, oy = curY;
         curX = Math.max(0, Math.min(m.widthPixels - 1, x));
         curY = Math.max(0, Math.min(m.heightPixels - 1, y));
-        if (trailOn && effect != null && (curX != ox || curY != oy)) effect.addTrail(curX, curY);
+        boolean changed = curX != ox || curY != oy;
+        if (trailOn && effect != null && changed) effect.addTrail(curX, curY);
         setCursorLp();
         try {
             wm.updateViewLayout(cursor, cursorLp);
         } catch (Exception ignored) {}
+        if (changed) {
+            scheduleTextCheck();
+            handler.removeCallbacks(calibRun);
+            handler.postDelayed(calibRun, 400);
+        }
     }
 
     private void moveCursorBy(float dx, float dy) {
         placeCursor(curX + dx, curY + dy);
+    }
+
+    // ---------- Posisi lingkaran (termasuk sembunyi) ----------
+
+    private void applyPadPos() {
+        if (padLp == null) return;
+        int savedX = sp.getInt("pad_x", dp(24));
+        int savedY = sp.getInt("pad_y", dp(80));
+        if (!padHidden) {
+            padLp.x = savedX;
+            padLp.y = savedY;
+            return;
+        }
+        DisplayMetrics m = screen();
+        int sliver = dp(28);
+        if (m.widthPixels > m.heightPixels) {
+            // Lanskap: sembunyi ke bawah layar
+            padLp.x = savedX;
+            padLp.y = sliver - padLp.height;
+        } else {
+            // Potret: sembunyi ke kiri atau kanan layar
+            padLp.y = savedY;
+            padLp.x = hideLeft ? m.widthPixels - sliver : sliver - padLp.width;
+        }
+    }
+
+    private void hidePad() {
+        if (pad == null || padHidden) return;
+        DisplayMetrics m = screen();
+        float centerX = m.widthPixels - padLp.x - padLp.width / 2f;
+        hideLeft = centerX < m.widthPixels / 2f;
+        padHidden = true;
+        moveMode = false;
+        hideMenu();
+        applyPadPos();
+        try {
+            wm.updateViewLayout(pad, padLp);
+        } catch (Exception ignored) {}
+        pad.invalidate();
+    }
+
+    private void showPad() {
+        if (pad == null || !padHidden) return;
+        padHidden = false;
+        applyPadPos();
+        try {
+            wm.updateViewLayout(pad, padLp);
+        } catch (Exception ignored) {}
+        pad.invalidate();
     }
 
     // ---------- Gestur ke layar ----------
@@ -356,12 +584,20 @@ public class CursorService extends AccessibilityService
         return true;
     }
 
-    // Gestur dari layanan tidak mengenai jendela milik sendiri, jadi menu dan benjolan ditangani di sini
+    // Gestur dari layanan tidak mengenai jendela milik sendiri, jadi lingkaran dan menu ditangani di sini
     private boolean handleOverlayTap() {
         if (menu != null && clickAt(menu, curX, curY)) return true;
         if (pad != null && pad.getVisibility() == View.VISIBLE && pad.getWidth() > 0) {
             int[] loc = new int[2];
             pad.getLocationOnScreen(loc);
+            if (padHidden) {
+                if (curX >= loc[0] && curX <= loc[0] + pad.getWidth()
+                        && curY >= loc[1] && curY <= loc[1] + pad.getHeight()) {
+                    showPad();
+                    return true;
+                }
+                return false;
+            }
             float bx = loc[0] + pad.bumpX(), by = loc[1] + pad.bumpY();
             if (Math.hypot(curX - bx, curY - by) <= pad.bumpR() * 1.6f) {
                 toggleMenu();
@@ -523,7 +759,7 @@ public class CursorService extends AccessibilityService
         final TextView val = menuItem("", null);
         val.setGravity(Gravity.CENTER);
         val.setText("Kecepatan " + (Math.round(gain * 10) / 10f) + "x");
-        TextView minus = menuItem("\u2212", new View.OnClickListener() {
+        TextView minus = menuItem("−", new View.OnClickListener() {
             public void onClick(View v) {
                 changeSpeed(-2, val);
             }
@@ -551,7 +787,7 @@ public class CursorService extends AccessibilityService
     }
 
     private void showMenu() {
-        if (menu != null || padLp == null) return;
+        if (menu != null || padLp == null || padHidden) return;
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(6), dp(6), dp(6), dp(6));
@@ -579,6 +815,11 @@ public class CursorService extends AccessibilityService
                     }
                 }));
         box.addView(speedRow());
+        box.addView(menuItem("Sembunyikan lingkaran", new View.OnClickListener() {
+            public void onClick(View v) {
+                hidePad();
+            }
+        }));
         box.addView(menuItem("Kembali", new View.OnClickListener() {
             public void onClick(View v) {
                 hideMenu();
@@ -604,19 +845,31 @@ public class CursorService extends AccessibilityService
             }
         }));
 
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        DisplayMetrics m = screen();
+        boolean land = m.widthPixels > m.heightPixels;
+        int est = dp(44) * 8 + dp(16);
+        int h = Math.min(est, m.heightPixels - dp(24));
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                h,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.BOTTOM | Gravity.END;
-        lp.x = padLp.x;
-        lp.y = Math.max(0, Math.min(padLp.y + padLp.height + dp(8),
-                screen().heightPixels - dp(380)));
-        wm.addView(box, lp);
-        menu = box;
+        if (land) {
+            // Lanskap: menu di sebelah kiri lingkaran, di tengah tinggi layar
+            lp.x = padLp.x + padLp.width + dp(8);
+            lp.y = Math.max(0, (m.heightPixels - h) / 2);
+        } else {
+            lp.x = padLp.x;
+            lp.y = Math.max(0, Math.min(padLp.y + padLp.height + dp(8), m.heightPixels - h));
+        }
+        wm.addView(sv, lp);
+        menu = sv;
     }
 
     // ---------- Tampilan ----------
@@ -632,6 +885,7 @@ public class CursorService extends AccessibilityService
         }
     }
 
+    // Lapisan efek seluas layar di bawah kursor: jejak dan riak ketuk
     private class EffectView extends View {
         private final ArrayList<Pt> trail = new ArrayList<Pt>();
         private final ArrayList<Pt> ripples = new ArrayList<Pt>();
@@ -654,6 +908,10 @@ public class CursorService extends AccessibilityService
 
         @Override
         protected void onDraw(Canvas canvas) {
+            // Titik awal jendela ini di layar, supaya efek tepat di titik klik kursor
+            int[] loc = new int[2];
+            getLocationOnScreen(loc);
+            float ox = loc[0], oy = loc[1];
             long now = SystemClock.uptimeMillis();
             paint.setStyle(Paint.Style.FILL);
             for (int i = trail.size() - 1; i >= 0; i--) {
@@ -664,7 +922,7 @@ public class CursorService extends AccessibilityService
                     continue;
                 }
                 paint.setColor(((int) (170 * (1f - age)) << 24) | 0x2196F3);
-                canvas.drawCircle(p.x, p.y, dp(6) * (1f - age * 0.5f), paint);
+                canvas.drawCircle(p.x - ox, p.y - oy, dp(6) * (1f - age * 0.5f), paint);
             }
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dp(3));
@@ -676,7 +934,7 @@ public class CursorService extends AccessibilityService
                     continue;
                 }
                 paint.setColor(((int) (210 * (1f - age)) << 24) | 0x2196F3);
-                canvas.drawCircle(p.x, p.y, dp(8) + dp(32) * age, paint);
+                canvas.drawCircle(p.x - ox, p.y - oy, dp(8) + dp(32) * age, paint);
             }
             if (!trail.isEmpty() || !ripples.isEmpty()) postInvalidateOnAnimation();
         }
@@ -685,7 +943,9 @@ public class CursorService extends AccessibilityService
     private class CursorView extends View {
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint thick = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint bmpPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final RectF oval = new RectF();
 
         CursorView(Context c) {
             super(c);
@@ -693,36 +953,78 @@ public class CursorService extends AccessibilityService
             fill.setStyle(Paint.Style.FILL);
             line.setColor(0xFF000000);
             line.setStyle(Paint.Style.STROKE);
+            thick.setStyle(Paint.Style.STROKE);
+            thick.setStrokeCap(Paint.Cap.ROUND);
+        }
+
+        // Dua garis: hitam tebal di bawah, putih tipis di atas
+        private void twoTone(Canvas c, float x1, float y1, float x2, float y2, float size) {
+            thick.setColor(0xFF000000);
+            thick.setStrokeWidth(Math.max(3f, size / 6f));
+            c.drawLine(x1, y1, x2, y2, thick);
+            thick.setColor(0xFFFFFFFF);
+            thick.setStrokeWidth(Math.max(1.5f, size / 12f));
+            c.drawLine(x1, y1, x2, y2, thick);
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
+            // Titik klik selalu di tengah jendela ini
             float cx = getWidth() / 2f, cy = getHeight() / 2f;
             float size = dp(cursorSizeDp);
+            int st = cursorState();
+            String shape = curN;
+            Bitmap bmp = bmpN;
+            boolean center = hotN;
+            if (st == 1 && !"same".equals(curT)) {
+                shape = curT;
+                bmp = bmpT;
+                center = hotT;
+            } else if (st == 2 && !"same".equals(curL)) {
+                shape = curL;
+                bmp = bmpL;
+                center = hotL;
+            }
+            float ang = (SystemClock.uptimeMillis() % 900L) / 900f * 360f;
+            if (st == 2) postInvalidateOnAnimation();
             line.setStrokeWidth(Math.max(1f, size / 16f));
 
-            if ("dot".equals(cursorShape)) {
-                canvas.drawCircle(cx, cy, size / 3f, fill);
-                canvas.drawCircle(cx, cy, size / 3f, line);
-            } else if ("cross".equals(cursorShape)) {
-                Paint thick = new Paint(Paint.ANTI_ALIAS_FLAG);
-                thick.setStyle(Paint.Style.STROKE);
-                thick.setColor(0xFF000000);
-                thick.setStrokeWidth(Math.max(3f, size / 6f));
-                canvas.drawLine(cx - size / 2f, cy, cx + size / 2f, cy, thick);
-                canvas.drawLine(cx, cy - size / 2f, cx, cy + size / 2f, thick);
-                thick.setColor(0xFFFFFFFF);
-                thick.setStrokeWidth(Math.max(1.5f, size / 12f));
-                canvas.drawLine(cx - size / 2f, cy, cx + size / 2f, cy, thick);
-                canvas.drawLine(cx, cy - size / 2f, cx, cy + size / 2f, thick);
-            } else if ("custom".equals(cursorShape) && customBmp != null) {
-                float bw = customBmp.getWidth(), bh = customBmp.getHeight();
+            if (shape.startsWith("img:") && bmp != null) {
+                float bw = bmp.getWidth(), bh = bmp.getHeight();
                 float sc = size / Math.max(bw, bh);
                 float w = bw * sc, h = bh * sc;
-                RectF dst = customCenter
+                RectF dst = center
                         ? new RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
                         : new RectF(cx, cy, cx + w, cy + h);
-                canvas.drawBitmap(customBmp, null, dst, bmpPaint);
+                if (st == 2) {
+                    canvas.save();
+                    canvas.rotate(ang, dst.centerX(), dst.centerY());
+                    canvas.drawBitmap(bmp, null, dst, bmpPaint);
+                    canvas.restore();
+                } else {
+                    canvas.drawBitmap(bmp, null, dst, bmpPaint);
+                }
+            } else if ("dot".equals(shape)) {
+                canvas.drawCircle(cx, cy, size / 3f, fill);
+                canvas.drawCircle(cx, cy, size / 3f, line);
+            } else if ("cross".equals(shape)) {
+                twoTone(canvas, cx - size / 2f, cy, cx + size / 2f, cy, size);
+                twoTone(canvas, cx, cy - size / 2f, cx, cy + size / 2f, size);
+            } else if ("ibeam".equals(shape)) {
+                float hh = size / 2f, sw = size / 6f;
+                twoTone(canvas, cx, cy - hh, cx, cy + hh, size);
+                twoTone(canvas, cx - sw, cy - hh, cx + sw, cy - hh, size);
+                twoTone(canvas, cx - sw, cy + hh, cx + sw, cy + hh, size);
+            } else if ("spinner".equals(shape)) {
+                float r = size * 0.4f;
+                oval.set(cx - r, cy - r, cx + r, cy + r);
+                thick.setStrokeCap(Paint.Cap.ROUND);
+                thick.setColor(0x55000000);
+                thick.setStrokeWidth(Math.max(3f, size / 6f));
+                canvas.drawOval(oval, thick);
+                thick.setColor(0xFF2196F3);
+                thick.setStrokeWidth(Math.max(2f, size / 8f));
+                canvas.drawArc(oval, ang, 100, false, thick);
             } else {
                 float s = size / 24f;
                 Path p = new Path();
@@ -749,7 +1051,7 @@ public class CursorService extends AccessibilityService
         private final int slop;
         private float downX, downY, lastX, lastY, dragSX, dragSY, startCurX, startCurY, mvX, mvY;
         private long downT;
-        private boolean hold, moved, live, onBump;
+        private boolean hold, moved, live, onBump, hiddenTouch;
         private VelocityTracker vt;
 
         private final Runnable holdRun = new Runnable() {
@@ -777,15 +1079,15 @@ public class CursorService extends AccessibilityService
             bumpLine.setStrokeWidth(3);
         }
 
-        private float bumpR() {
+        float bumpR() {
             return dp(12);
         }
 
-        private float bumpX() {
+        float bumpX() {
             return getWidth() - bumpR() - 2;
         }
 
-        private float bumpY() {
+        float bumpY() {
             return bumpR() + 2;
         }
 
@@ -796,7 +1098,8 @@ public class CursorService extends AccessibilityService
         @Override
         protected void onDraw(Canvas canvas) {
             boolean busy = hold || live;
-            fill.setColor(busy ? 0xFF2196F3 : (moveMode ? 0xFFEF6C00 : (liveMode ? 0xFF2E7D32 : 0xFF607D8B)));
+            fill.setColor(busy ? 0xFF2196F3
+                    : (moveMode ? 0xFFEF6C00 : (liveMode ? 0xFF2E7D32 : 0xFF607D8B)));
             RectF r = new RectF(4, 4, getWidth() - 4, getHeight() - 4);
             if (circle) {
                 canvas.drawOval(r, fill);
@@ -822,6 +1125,10 @@ public class CursorService extends AccessibilityService
         public boolean onTouchEvent(MotionEvent e) {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
+                    if (padHidden) {
+                        hiddenTouch = true;
+                        return true;
+                    }
                     downX = lastX = e.getX();
                     downY = lastY = e.getY();
                     downT = System.currentTimeMillis();
@@ -843,7 +1150,7 @@ public class CursorService extends AccessibilityService
                     if (!liveMode) postDelayed(holdRun, HOLD_MS);
                     return true;
                 case MotionEvent.ACTION_MOVE:
-                    if (onBump) return true;
+                    if (hiddenTouch || onBump) return true;
                     if (moveMode) {
                         DisplayMetrics sm = screen();
                         padLp.x = Math.max(0, Math.min(sm.widthPixels - padLp.width,
@@ -884,6 +1191,11 @@ public class CursorService extends AccessibilityService
                     return true;
                 case MotionEvent.ACTION_UP: {
                     removeCallbacks(holdRun);
+                    if (hiddenTouch) {
+                        hiddenTouch = false;
+                        showPad();
+                        return true;
+                    }
                     if (onBump) {
                         onBump = false;
                         if (nearBump(e.getX(), e.getY(), dp(24))) toggleMenu();
@@ -927,6 +1239,7 @@ public class CursorService extends AccessibilityService
                     if (live) endLive();
                     recycleVt();
                     onBump = false;
+                    hiddenTouch = false;
                     hold = false;
                     live = false;
                     invalidate();

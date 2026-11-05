@@ -26,6 +26,8 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
 
 public class MainActivity extends Activity {
     static final String PREFS = "cfg";
@@ -39,16 +41,24 @@ public class MainActivity extends Activity {
     private static final String[] ACT_VALUES = {
             "swipe", "scroll", "back", "home", "recents", "notif", "none"};
 
+    private static final String[] SLOT_KEYS = {"cur_normal", "cur_text", "cur_load"};
+    private static final String[] SLOT_DEFS = {"arrow", "ibeam", "spinner"};
+
     private interface Fmt {
         String text(int v);
     }
 
     private SharedPreferences sp;
     private LinearLayout root;
-    private RadioGroup cursorGroup;
 
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density);
+    }
+
+    private File imgDir() {
+        File d = new File(getFilesDir(), "cursors");
+        if (!d.exists()) d.mkdirs();
+        return d;
     }
 
     private TextView label(String text, int topDp) {
@@ -124,6 +134,93 @@ public class MainActivity extends Activity {
         root.addView(spin);
     }
 
+    // Satu keadaan kursor: pilih bentuk bawaan atau gambar tersimpan, tambah atau hapus gambar
+    private void addSlot(String title, final String key, final String def,
+                         String hotKey, boolean hotDef, boolean allowSame) {
+        section(title);
+        final ArrayList<String> labels = new ArrayList<String>();
+        final ArrayList<String> values = new ArrayList<String>();
+        if (allowSame) {
+            labels.add("Sama seperti kursor normal");
+            values.add("same");
+        }
+        String[] bl = {"Panah", "Titik", "Silang", "Teks (I-beam)", "Cincin loading"};
+        String[] bv = {"arrow", "dot", "cross", "ibeam", "spinner"};
+        for (int i = 0; i < bl.length; i++) {
+            labels.add(bl[i]);
+            values.add(bv[i]);
+        }
+        File[] fs = imgDir().listFiles();
+        if (fs != null) {
+            Arrays.sort(fs);
+            for (File f : fs) {
+                if (f.getName().endsWith(".png")) {
+                    labels.add("Gambar: " + f.getName().replace(".png", ""));
+                    values.add("img:" + f.getName());
+                }
+            }
+        }
+
+        final Spinner spin = new Spinner(this);
+        ArrayAdapter<String> ad = new ArrayAdapter<String>(
+                this, android.R.layout.simple_spinner_item, labels);
+        ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spin.setAdapter(ad);
+        int idx = values.indexOf(sp.getString(key, def));
+        if (idx >= 0) spin.setSelection(idx);
+        spin.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            public void onItemSelected(AdapterView<?> parent, View v, int pos, long id) {
+                String val = values.get(pos);
+                if (!val.equals(sp.getString(key, def))) {
+                    sp.edit().putString(key, val).apply();
+                }
+            }
+
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        root.addView(spin);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        Button add = new Button(this);
+        add.setText("Tambah gambar");
+        add.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                sp.edit().putString("pending_slot", key).commit();
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("image/*");
+                startActivityForResult(i, REQ_IMG);
+            }
+        });
+        Button del = new Button(this);
+        del.setText("Hapus gambar ini");
+        del.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                String val = values.get(spin.getSelectedItemPosition());
+                if (!val.startsWith("img:")) {
+                    Toast.makeText(MainActivity.this,
+                            "Pilih gambar tersimpan dulu", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                new File(imgDir(), val.substring(4)).delete();
+                SharedPreferences.Editor ed = sp.edit();
+                for (int i = 0; i < SLOT_KEYS.length; i++) {
+                    if (val.equals(sp.getString(SLOT_KEYS[i], SLOT_DEFS[i]))) {
+                        ed.putString(SLOT_KEYS[i], SLOT_DEFS[i]);
+                    }
+                }
+                ed.apply();
+                recreate();
+            }
+        });
+        row.addView(add, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(del, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(row);
+
+        addSwitch("Titik klik di tengah gambar (mati = pojok kiri atas)", hotKey, hotDef);
+    }
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -176,45 +273,12 @@ public class MainActivity extends Activity {
         addSwitch("Jejak kursor (trail)", "trail", false);
         addSwitch("Efek ketuk", "tap_fx", false);
 
-        section("Bentuk kursor");
-        cursorGroup = new RadioGroup(this);
-        cursorGroup.setOrientation(RadioGroup.VERTICAL);
-        String[] names = {"Panah", "Titik", "Silang", "Gambar sendiri"};
-        String[] vals = {"arrow", "dot", "cross", "custom"};
-        String curShape = sp.getString("cursor_shape", "arrow");
-        for (int i = 0; i < names.length; i++) {
-            RadioButton rb = new RadioButton(this);
-            rb.setText(names[i]);
-            rb.setId(100 + i);
-            cursorGroup.addView(rb);
-            if (vals[i].equals(curShape)) cursorGroup.check(100 + i);
-        }
-        final String[] valsF = vals;
-        cursorGroup.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
-            public void onCheckedChanged(RadioGroup g, int id) {
-                int i = id - 100;
-                if (i >= 0 && i < valsF.length) {
-                    sp.edit().putString("cursor_shape", valsF[i]).apply();
-                }
+        section("Ukuran dan gambar kursor");
+        addSeek("cursor_size", 16, 96, 24, new Fmt() {
+            public String text(int v) {
+                return "Ukuran kursor: " + v + " (gambar kecil otomatis diperbesar sampai ukuran ini)";
             }
         });
-        root.addView(cursorGroup);
-
-        Button pick = new Button(this);
-        pick.setText("Pilih gambar kursor (PNG atau JPG)");
-        pick.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                i.addCategory(Intent.CATEGORY_OPENABLE);
-                i.setType("image/*");
-                startActivityForResult(i, REQ_IMG);
-            }
-        });
-        root.addView(pick);
-
-        addSwitch("Gambar sendiri: titik klik di tengah gambar (mati = pojok kiri atas)",
-                "custom_center", false);
-
         addSwitch("Gambar sendiri: hapus warna latar", "custom_rm", true);
         addSeek("custom_tol", 5, 120, 40, new Fmt() {
             public String text(int v) {
@@ -222,9 +286,12 @@ public class MainActivity extends Activity {
             }
         });
 
-        addSeek("cursor_size", 16, 96, 24, new Fmt() {
+        addSlot("Kursor normal", "cur_normal", "arrow", "hot_normal", false, false);
+        addSlot("Kursor di atas kolom teks", "cur_text", "ibeam", "hot_text", true, true);
+        addSlot("Kursor loading (saat membuka aplikasi)", "cur_load", "spinner", "hot_load", true, true);
+        addSeek("load_ms", 0, 3000, 1200, new Fmt() {
             public String text(int v) {
-                return "Ukuran kursor: " + v;
+                return v == 0 ? "Animasi loading: mati" : "Lama animasi loading: " + v + " ms";
             }
         });
 
@@ -288,19 +355,20 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            File f = new File(getFilesDir(), "cursor.png");
-            FileOutputStream out = new FileOutputStream(f);
+            String name = "img_" + System.currentTimeMillis() + ".png";
+            FileOutputStream out = new FileOutputStream(new File(imgDir(), name));
             bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
             out.close();
 
-            sp.edit()
-                    .putString("cursor_shape", "custom")
-                    .putLong("cursor_ver", System.currentTimeMillis())
-                    .apply();
-            cursorGroup.check(103);
-            Toast.makeText(this, "Gambar kursor dipasang", Toast.LENGTH_SHORT).show();
+            String slot = sp.getString("pending_slot", "cur_normal");
+            SharedPreferences.Editor ed = sp.edit();
+            ed.putString(slot, "img:" + name);
+            if (sp.getInt("cursor_size", 24) < 40) ed.putInt("cursor_size", 40);
+            ed.apply();
+            Toast.makeText(this, "Gambar disimpan dan dipasang", Toast.LENGTH_SHORT).show();
+            recreate();
         } catch (Exception e) {
-            Toast.makeText(this, "Gagal memasang gambar", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Gagal menyimpan gambar", Toast.LENGTH_LONG).show();
         }
     }
 }
